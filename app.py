@@ -34,7 +34,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-# ==================== HELPER ====================
+# ==================== HELPER FUNCTIONS ====================
 def get_bdt_date():
     return (datetime.utcnow() + timedelta(hours=6)).strftime("%Y-%m-%d")
 
@@ -43,6 +43,28 @@ def get_bdt_time():
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
+
+def check_active_session(request: Request):
+    username = request.session.get("username")
+    token = request.session.get("session_token")
+    if not username or not token:
+        return False
+    try:
+        res = supabase.table("users").select("session_token").eq("username", username).execute()
+        if res.data and res.data[0].get("session_token") == token:
+            return True
+    except:
+        pass
+    return False
+
+def check_and_reset_credits(username):
+    try:
+        res = supabase.table("users").select("daily_credits").eq("username", username).execute()
+        if res.data:
+            return res.data[0].get("daily_credits", 0)
+    except:
+        pass
+    return 0
 
 # ==================== IMPROVED PROCESS MASTER PDF ====================
 def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percentage, shared_id):
@@ -77,18 +99,26 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
 
     font_noto = None
     font_noto_sb = None
+    font_lexend = None
 
-    try:
-        if os.path.exists(notosans_path):
+    if os.path.exists(notosans_path):
+        try:
             font_noto = page1.insert_font(fontname="notosans", fontfile=notosans_path)
-    except:
-        pass
+        except:
+            font_noto = None
 
-    try:
-        if os.path.exists(notosans_sb_path):
+    if os.path.exists(notosans_sb_path):
+        try:
             font_noto_sb = page1.insert_font(fontname="notosans_sb", fontfile=notosans_sb_path)
-    except:
-        pass
+        except:
+            font_noto_sb = None
+
+    if os.path.exists(lexend_path) and len(template_doc) > 1:
+        try:
+            page2 = template_doc[1]
+            font_lexend = page2.insert_font(fontname="lexend", fontfile=lexend_path)
+        except:
+            font_lexend = None
 
     # Page 1 replacements
     page1_text = page1.get_text()
@@ -119,18 +149,13 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
         for inst in page2.search_for("58% detected as AI"):
             page2.add_redact_annot(fitz.Rect(inst.x0, inst.y0 - 2, inst.x1 + 5, inst.y1 - 4), fill=(1, 1, 1))
             page2.apply_redactions()
-            if os.path.exists(lexend_path):
-                try:
-                    page2.insert_font(fontname="lexend", fontfile=lexend_path)
-                    page2.insert_text((inst.x0, inst.y1 - 4), f"{ai_percentage}% detected as AI", fontsize=16.5, fontname="lexend", color=(0, 0, 0))
-                except:
-                    page2.insert_text((inst.x0, inst.y1 - 4), f"{ai_percentage}% detected as AI", fontsize=17, fontname="helv", color=(0, 0, 0))
+            if font_lexend:
+                page2.insert_text((inst.x0, inst.y1 - 4), f"{ai_percentage}% detected as AI", fontsize=16.5, fontname="lexend", color=(0, 0, 0))
             else:
                 page2.insert_text((inst.x0, inst.y1 - 4), f"{ai_percentage}% detected as AI", fontsize=17, fontname="helv", color=(0, 0, 0))
 
     template_doc.insert_pdf(user_doc)
 
-    # Header & Footer
     logo_path = os.path.join(base_dir, "static", "logo.png")
 
     for i, page in enumerate(template_doc):
@@ -274,31 +299,173 @@ async def upload_file(request: Request, file_ai: UploadFile = File(...), file_si
     except Exception as e:
         return HTMLResponse(content=f"<h3>Error: {str(e)}</h3>", status_code=500)
 
-# ==================== অন্যান্য রুট (একই) ====================
-def check_active_session(request: Request):
+@app.get("/download_past_file/{file_id}")
+async def download_past_file(request: Request, file_id: int, background_tasks: BackgroundTasks):
+    if not check_active_session(request):
+        request.session.clear()
+        return RedirectResponse(url="/login", status_code=303)
+    
     username = request.session.get("username")
-    token = request.session.get("session_token")
-    if not username or not token:
-        return False
     try:
-        res = supabase.table("users").select("session_token").eq("username", username).execute()
-        if res.data and res.data[0].get("session_token") == token:
-            return True
-    except:
-        pass
-    return False
-
-def check_and_reset_credits(username):
-    try:
-        res = supabase.table("users").select("daily_credits").eq("username", username).execute()
+        res = supabase.table("file_history").select("filename").eq("id", file_id).eq("username", username).execute()
         if res.data:
-            return res.data[0].get("daily_credits", 0)
+            saved_filename = res.data[0]['filename']
+            output_path = os.path.join(OUTPUT_DIR, saved_filename)
+            upload_filename = saved_filename.replace("Report_", "", 1) if saved_filename.startswith("Report_") else saved_filename.replace("Edited_", "", 1)
+            
+            if os.path.exists(output_path):
+                background_tasks.add_task(delete_file_and_history, file_id, output_path, upload_filename)
+                return FileResponse(output_path, media_type="application/pdf", filename=saved_filename[9:])
+    except Exception as e:
+        print(e)
+        
+    return HTMLResponse("<h3>ফাইলটি সার্ভারে পাওয়া যায়নি বা ইতিমধ্যে ডিলিট হয়ে গেছে!</h3><br><a href='/'>হোমে ফিরে যান</a>", status_code=404)
+
+def delete_file_and_history(file_id: int, output_path: str, upload_filename: str):
+    time.sleep(30)
+    try:
+        if os.path.exists(output_path): os.remove(output_path)
+        in_path = os.path.join(UPLOAD_DIR, upload_filename)
+        if os.path.exists(in_path): os.remove(in_path)
+        supabase.table("file_history").delete().eq("id", file_id).execute()
+    except Exception as e:
+        print("Delete error:", e)
+
+@app.post("/delete_my_file")
+async def delete_my_file(request: Request, file_id: int = Form(...)):
+    if not check_active_session(request):
+        return RedirectResponse(url="/login", status_code=303)
+    username = request.session.get("username")
+    try:
+        res = supabase.table("file_history").select("filename").eq("id", file_id).eq("username", username).execute()
+        if res.data:
+            saved_filename = res.data[0]['filename']
+            out_path = os.path.join(OUTPUT_DIR, saved_filename)
+            upload_filename = saved_filename.replace("Report_", "", 1) if saved_filename.startswith("Report_") else saved_filename.replace("Edited_", "", 1)
+            in_path = os.path.join(UPLOAD_DIR, upload_filename)
+            if os.path.exists(in_path): os.remove(in_path)
+            if os.path.exists(out_path): os.remove(out_path)
+            supabase.table("file_history").delete().eq("id", file_id).execute()
     except:
         pass
-    return 0
+    return RedirectResponse(url="/", status_code=303)
 
-# বাকি সব রুট (delete, admin, download ইত্যাদি) তোর আগের ফাইলের মতোই আছে।
-# তুই যদি চাস, আমি পুরো ফাইলটা আবার একসাথে দিতে পারি।
+@app.post("/delete_all_files")
+async def delete_all_files(request: Request):
+    if not check_active_session(request):
+        return RedirectResponse(url="/login", status_code=303)
+    try:
+        supabase.table("file_history").delete().eq("username", request.session.get("username")).execute()
+    except:
+        pass
+    return RedirectResponse(url="/", status_code=303)
+
+# ==================== ADMIN ROUTES ====================
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(request: Request):
+    if not check_active_session(request) or request.session.get("role") != "admin":
+        return HTMLResponse("Access Denied", status_code=403)
+    
+    users, history, daily_usage_list = [], [], []
+    today = get_bdt_date()
+    
+    try:
+        users_res = supabase.table("users").select("username, role, daily_credits, used_credits").execute()
+        if users_res.data:
+            for u in users_res.data:
+                uname = u['username']
+                logs_today = supabase.table("credit_logs").select("id").eq("username", uname).eq("usage_date", today).execute()
+                used_today = len(logs_today.data) if logs_today.data else 0
+                total_used = u.get('used_credits', 0) if u.get('used_credits') is not None else 0
+                users.append((uname, u['role'], u['daily_credits'], used_today, total_used))
+
+        hist_res = supabase.table("file_history").select("username, filename, processed_date").order("id", desc=True).limit(50).execute()
+        if hist_res.data:
+            history = [(h['username'], h['filename'], h['processed_date']) for h in hist_res.data]
+                
+        five_days_ago = (datetime.utcnow() + timedelta(hours=6) - timedelta(days=5)).strftime("%Y-%m-%d")
+        supabase.table("credit_logs").delete().lt("usage_date", five_days_ago).execute()
+        
+        usage_res = supabase.table("credit_logs").select("username, usage_date").execute()
+        if usage_res.data:
+            usage_dict = {}
+            for row in usage_res.data:
+                key = (row['username'], row['usage_date'])
+                usage_dict[key] = usage_dict.get(key, 0) + 1
+            daily_usage_list = sorted([{"username": u, "date": d, "used": count} for (u, d), count in usage_dict.items()], key=lambda x: x['date'], reverse=True)
+            
+    except:
+        pass
+    
+    total_files = len(os.listdir(UPLOAD_DIR)) + len(os.listdir(OUTPUT_DIR))
+    return templates.TemplateResponse(request=request, name="admin.html", context={"request": request, "users": users, "history": history, "total_files": total_files, "daily_usage": daily_usage_list})
+
+@app.post("/admin/create_user")
+async def create_user(request: Request, new_username: str = Form(...), new_password: str = Form(...), initial_credits: int = Form(5)):
+    if not check_active_session(request) or request.session.get("role") != "admin":
+        return HTMLResponse("Access Denied", status_code=403)
+    try:
+        supabase.table("users").insert({
+            "username": new_username, 
+            "password": hash_password(new_password), 
+            "role": "user", 
+            "daily_credits": initial_credits, 
+            "credit_limit": initial_credits, 
+            "used_credits": 0, 
+            "last_reset_date": get_bdt_date()
+        }).execute()
+    except:
+        pass
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/update_credits")
+async def update_credits(request: Request, up_username: str = Form(...), new_credits: int = Form(...)):
+    if not check_active_session(request) or request.session.get("role") != "admin":
+        return HTMLResponse("Access Denied", status_code=403)
+    try:
+        supabase.table("users").update({
+            "daily_credits": int(new_credits), 
+            "credit_limit": int(new_credits)
+        }).eq("username", up_username).execute()
+    except:
+        pass
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/reset_used_credits")
+async def reset_used_credits(request: Request, rst_username: str = Form(...)):
+    if not check_active_session(request) or request.session.get("role") != "admin":
+        return HTMLResponse("Access Denied", status_code=403)
+    try:
+        supabase.table("users").update({"used_credits": 0}).eq("username", rst_username).execute()
+    except:
+        pass
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/delete_user")
+async def delete_user(request: Request, del_username: str = Form(...)):
+    if not check_active_session(request) or request.session.get("role") != "admin":
+        return HTMLResponse("Access Denied", status_code=403)
+    if del_username == "admin":
+        return HTMLResponse("Admin account cannot be deleted!", status_code=400)
+    try:
+        supabase.table("users").delete().eq("username", del_username).execute()
+    except:
+        pass
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/clear_all_files")
+async def clear_all_files(request: Request):
+    if not check_active_session(request) or request.session.get("role") != "admin":
+        return HTMLResponse("Access Denied", status_code=403)
+    for folder in [UPLOAD_DIR, OUTPUT_DIR]:
+        for f in os.listdir(folder):
+            if os.path.isfile(os.path.join(folder, f)):
+                os.remove(os.path.join(folder, f))
+    try:
+        supabase.table("file_history").delete().neq("id", 0).execute()
+    except:
+        pass
+    return RedirectResponse(url="/admin", status_code=303)
 
 if __name__ == '__main__':
     import uvicorn
