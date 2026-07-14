@@ -135,10 +135,14 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
 
     page1 = template_doc[0]
 
-    # NotoSans font load (যদি static এ থাকে)
-    notosans_path = os.path.join("static", "NotoSans-Regular.ttf")
-    notosans_semibold_path = os.path.join("static", "NotoSans-SemiBold.ttf")
+    # ==================== Absolute Path দিয়ে Font Load ====================
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    notosans_path = os.path.join(base_dir, "static", "NotoSans-Regular.ttf")
+    notosans_semibold_path = os.path.join(base_dir, "static", "NotoSans-SemiBold.ttf")
+    lexend_path = os.path.join(base_dir, "static", "LexendDeca-Medium.ttf")
+
     has_noto = os.path.exists(notosans_path) and os.path.exists(notosans_semibold_path)
+    has_lexend = os.path.exists(lexend_path)
 
     if has_noto:
         try:
@@ -180,11 +184,11 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
             inst = ai_headers[0]
             page2.add_redact_annot(fitz.Rect(inst.x0, inst.y0 - 2, inst.x1 + 5, inst.y1 - 4), fill=(1, 1, 1))
             page2.apply_redactions()
+
             font_name_to_use, font_size_to_use = "helv", 17
-            font_path = os.path.join("static", "LexendDeca-Medium.ttf")
-            if os.path.exists(font_path):
+            if has_lexend:
                 try:
-                    page2.insert_font(fontname="lexend", fontfile=font_path)
+                    page2.insert_font(fontname="lexend", fontfile=lexend_path)
                     font_name_to_use, font_size_to_use = "lexend", 16.5
                 except:
                     pass
@@ -210,9 +214,7 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
 
     template_doc.insert_pdf(user_doc)
     
-    logo_path = "static/logo.png"
-    if not os.path.exists(logo_path):
-        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo.png")
+    logo_path = os.path.join(base_dir, "static", "logo.png")
 
     for i, page in enumerate(template_doc):
         rect = page.rect
@@ -251,9 +253,7 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
 def apply_header_and_footer(input_pdf_path, output_path, shared_id):
     doc = fitz.open(input_pdf_path)
     
-    logo_path = "static/logo.png"
-    if not os.path.exists(logo_path):
-        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo.png")
+    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo.png")
 
     for i, page in enumerate(doc):
         rect = page.rect
